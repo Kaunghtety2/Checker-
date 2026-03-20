@@ -1,0 +1,1 @@
+worker: playwright install chromium --with-deps && python site_checker_botv7.py
