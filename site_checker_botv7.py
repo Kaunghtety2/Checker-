@@ -448,36 +448,119 @@ CNAME_GW: dict[str,str] = {
 PAYMENT_KW = ("checkout","cart","payment","pay","order","billing",
               "stripe","paypal","purchase","buy","shop","basket")
 
-# 3DS signatures
-THREEDS_HIGH = [
-    "songbird.cardinalcommerce.com","Cardinal.setup(","cardinalcommerce",
-    "stripe.confirmCardPayment","stripe.handleCardAction","stripe.confirmPayment",
-    "requires_action","use_stripe_sdk","redirect_to_url","next_action",
-    "authenticate_source","challenge_required","authentication_required",
-    "threeDS2","threeds2","adyen.threeDS","threeDS2Challenge","fingerprintToken",
-    "braintree.threeDSecure","threeDSecureParameters","liabilityShifted",
-    "pa_req","PaReq","pareq","acs_url","ACSUrl","acsUrl",
-    "ThreeDSMethodURL","threeDSMethodURL","term_url","TermUrl",
-    "enrolled=Y","verifyEnrollment","liability_shift","liabilityShift",
-    "EMV3DS","emv3ds","deviceChannel","browserAcceptHeader","transStatus",
-    "cko-3ds","dfReferenceId","ThreeDSecure",
-    # Stripe 3DS redirect patterns
+# ══════════════════════════════════════════════
+#  3DS / 2D SIGNATURES
+#
+#  HIGH = genuine 3DS protocol evidence ONLY.
+#         Generic Stripe API terms (confirmCardPayment,
+#         requires_action, next_action, ThreeDSecure …)
+#         appear on ALL Stripe sites — DO NOT put them here.
+#
+#  MED  = supporting hints that alone are not conclusive.
+#
+#  TWOD = explicit 2D bypass / non-SCA signals.
+# ══════════════════════════════════════════════
+
+# ── Cardinal Commerce (dedicated 3DS service) ──────────────────────
+THREEDS_CARDINAL = [
+    "songbird.cardinalcommerce.com",
+    "Cardinal.setup(",
+    "cardinalcommerce.com",
+    "dfReferenceId",          # Cardinal device fingerprint token
+    "Cardinal.trigger(",
+    "Cardinal.on(",
+]
+
+# ── 3DS v1 protocol fields ─────────────────────────────────────────
+THREEDS_V1 = [
+    "pa_req", "PaReq", "pareq",          # payer-auth request
+    "acs_url", "ACSUrl", "acsUrl",        # access control server
+    "term_url", "TermUrl",                # termination URL
+    "enrolled=Y", "enrolled=y",
+    "verifyEnrollment",
+    "pares", "PARes",                     # payer-auth response
+]
+
+# ── 3DS v2 / EMV3DS protocol fields ───────────────────────────────
+THREEDS_V2 = [
+    "ThreeDSMethodURL", "threeDSMethodURL",
+    "threeDS2Challenge",
+    "EMV3DS", "emv3ds",
+    "deviceChannel",                      # 3DS v2 browser/app channel
+    "browserAcceptHeader",                # 3DS v2 browser data
+    "threeDSServerTransID",
+    "dsTransId", "dsTransID",
+    "acsTransId",
+    "challengeWindowSize",
+    "messageType.*AReq",
+    "messageType.*ARes",
+    "messageType.*CReq",
+    "messageType.*CRes",
+]
+
+# ── Provider-specific 3DS calls ────────────────────────────────────
+THREEDS_PROVIDER = [
+    "adyen.threeDS",
+    "adyen-3ds",
+    "braintree.threeDSecure",             # Braintree 3DS create
+    "threeDSecureParameters",             # Braintree 3DS params
+    "liabilityShifted",                   # Braintree post-auth result
+    "liabilityShift",
+    "cko-3ds",                            # Checkout.com 3DS
+    "fingerprintToken",                   # 3DS fingerprint token
+    "challenge_required",                 # explicit 3DS challenge
+    "transStatus",                        # 3DS transaction status
+    "eci_flag",                           # Electronic Commerce Indicator
+    "cavv",                               # Cardholder Auth Verification
+    "xid_",                               # 3DS v1 transaction ID prefix
+]
+
+# ── Stripe Checkout redirect (always enforces 3DS when needed) ─────
+THREEDS_STRIPE_REDIRECT = [
     "checkout.stripe.com/c/pay/cs_live",
     "checkout.stripe.com/c/pay/cs_test",
-    "stripe.com/pay/",
 ]
 
+# ── Merged HIGH list ───────────────────────────────────────────────
+THREEDS_HIGH = (
+    THREEDS_CARDINAL +
+    THREEDS_V1 +
+    THREEDS_V2 +
+    THREEDS_PROVIDER
+)
+
+# ── MED: supporting hints only (low weight) ────────────────────────
 THREEDS_MED = [
-    "3dsecure","3d_secure","3ds_method","payment_intent",
-    "verifiedbyvisa","securecode","safekey",
-    "sca","strong_customer_authentication",
-    "authentication_url","authenticationUrl",
-    "stripe_3ds","3ds2",
+    "3dsecure", "3d_secure", "3ds_method",
+    "threeDS2", "threeds2", "3ds2",
+    "verifiedbyvisa", "securecode", "safekey",   # card-network programs
+    "authentication_url", "authenticationUrl",
+    "payer_authentication", "payer_auth",
+    "authentication_required",
+    "ds_transaction", "directory_server",
+    "stripe_3ds",
+    # Stripe request_three_d_secure = 'any' forces 3DS
+    "request_three_d_secure",
 ]
 
+# ── 2D bypass / explicit non-SCA ──────────────────────────────────
 TWOD_SIGS = [
-    "no3ds","skip_3ds","bypass_3ds","3ds=false",
-    "threeds=false","disable_3ds","direct_charge",
+    r"no3ds",
+    r"skip_3ds",
+    r"bypass_3ds",
+    r"3ds=false",
+    r"threeds=false",
+    r"disable_3ds",
+    r"direct_charge",
+    r"no_authentication",
+    r"direct_post",
+    r"moto_payment",
+    r"skip_authentication",
+    r"three_d_secure.*false",
+    r"3ds_required.*false",
+    r"\"moto\"",               # MOTO transaction type
+    r"payment_method_options.*moto",
+    r"request_three_d_secure.*never",   # Stripe: never request 3DS
 ]
 
 JS_HOOK = """
@@ -625,6 +708,16 @@ async def db_all_uids() -> list[int]:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT uid FROM users WHERE is_banned=0") as c:
             return [r[0] for r in await c.fetchall()]
+
+async def db_all_users() -> list[dict]:
+    """Return all users with full details, sorted by scan_count desc."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT uid, username, first_name, scan_count, daily_scans, daily_date, "
+            "daily_limit, is_banned, is_vip, joined_at FROM users ORDER BY scan_count DESC"
+        ) as c:
+            cols = [d[0] for d in c.description]
+            return [dict(zip(cols, r)) for r in await c.fetchall()]
 
 async def db_set(uid, col, val):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1004,44 +1097,116 @@ def detect_tech(corpus):
 
 def detect_3ds(corpus, redirect_urls: list[str] = None):
     """
-    Improved 3DS detection with redirect URL check.
-    Stripe 3DS redirects to checkout.stripe.com/c/pay/cs_live_...
+    3DS detection v3 — protocol-level evidence only.
+
+    Scoring:
+      Stripe Checkout redirect (cs_live) → +20  (definitive, Stripe enforces 3DS)
+      Stripe Checkout redirect (cs_test) → +15
+      Cardinal Commerce sig              → +8 each
+      3DS v1 protocol field              → +8 each  (pa_req, ACSUrl …)
+      3DS v2 protocol field              → +8 each  (EMV3DS, ThreeDSMethodURL …)
+      Provider 3DS sig                   → +6 each  (adyen.threeDS, braintree.threeDSecure …)
+      MED hint                           → +2 each  (generic 3DS terms)
+      2D bypass sig                      → forces 2D regardless of score
+
+    Decision:
+      2D sig found           → 2D (No 3DS)
+      score >= 16            → 3D Secure ✅ Confirmed
+      score 8–15             → 3D Secure ✅ Likely
+      score 4–7              → 3D Secure ⚠️ Possible
+      score 0–3              → Unknown
     """
-    lo    = corpus.lower()
+    lo   = corpus.lower()
     score = 0
     evid  = []
 
-    # Check redirect URLs for Stripe 3DS
+    def hit(sig, pts, label=None):
+        nonlocal score
+        score += pts
+        tag = label or sig
+        if len(evid) < 8: evid.append(tag)
+
+    # ── Stripe Checkout redirect — strongest signal ─────────────────
     if redirect_urls:
         for rurl in redirect_urls:
             if "checkout.stripe.com/c/pay/cs_live" in rurl:
-                score += 10
-                evid.append("Stripe 3DS redirect (cs_live)")
+                hit("Stripe Checkout redirect (cs_live)", 20); break
             elif "checkout.stripe.com/c/pay/cs_test" in rurl:
-                score += 8
-                evid.append("Stripe 3DS redirect (cs_test)")
-            elif "stripe.com/pay/" in rurl:
-                score += 6
-                evid.append("Stripe Pay redirect")
+                hit("Stripe Checkout redirect (cs_test)", 15); break
 
-    for sig in THREEDS_HIGH:
+    # Also check corpus for redirect URLs embedded in HTML/JS
+    for sig in THREEDS_STRIPE_REDIRECT:
+        if sig.lower() in lo and "Stripe Checkout redirect" not in " ".join(evid):
+            hit(sig, 15)
+            break
+
+    # ── Cardinal Commerce ───────────────────────────────────────────
+    for sig in THREEDS_CARDINAL:
         if sig.lower() in lo:
-            score += 3
-            if len(evid) < 8: evid.append(sig)
+            hit(sig, 8)
 
+    # ── 3DS v1 protocol fields ──────────────────────────────────────
+    for sig in THREEDS_V1:
+        if sig.lower() in lo:
+            hit(sig, 8)
+
+    # ── 3DS v2 / EMV3DS fields ──────────────────────────────────────
+    for sig in THREEDS_V2:
+        # Some V2 sigs use regex (messageType patterns)
+        try:
+            if re.search(sig.lower(), lo):
+                hit(sig, 8)
+        except re.error:
+            if sig.lower() in lo:
+                hit(sig, 8)
+
+    # ── Provider-specific 3DS ───────────────────────────────────────
+    for sig in THREEDS_PROVIDER:
+        if sig.lower() in lo:
+            hit(sig, 6)
+
+    # ── MED hints (supporting only, low weight) ─────────────────────
     for sig in THREEDS_MED:
         if sig.lower() in lo:
-            score += 1
-            if len(evid) < 8: evid.append(sig)
+            hit(sig, 2)
 
-    twod = any(s.lower() in lo for s in TWOD_SIGS)
+    # ── 2D bypass / non-SCA ─────────────────────────────────────────
+    twod_sig = None
+    for pat in TWOD_SIGS:
+        try:
+            m = re.search(pat, lo)
+            if m:
+                twod_sig = pat
+                break
+        except re.error:
+            if pat.lower() in lo:
+                twod_sig = pat
+                break
 
-    if score >= 3:               mode = "3D"
-    elif score >= 1 and not twod: mode = "3D"
-    elif twod:                   mode = "2D"
-    else:                        mode = "Unknown"
+    # ── Decision ────────────────────────────────────────────────────
+    if twod_sig:
+        mode  = "2D"
+        label = f"2D (No 3DS)"
+    elif score >= 16:
+        mode  = "3D"
+        label = "3D Secure ✅ Confirmed"
+    elif score >= 8:
+        mode  = "3D"
+        label = "3D Secure ✅ Likely"
+    elif score >= 4:
+        mode  = "3D"
+        label = "3D Secure ⚠️ Possible"
+    else:
+        mode  = "Unknown"
+        label = "Unknown"
 
-    return {"mode":mode,"score":score,"evidence":list(dict.fromkeys(evid))[:5]}
+    return {
+        "mode":     mode,
+        "label":    label,
+        "score":    score,
+        "evidence": list(dict.fromkeys(evid))[:5],
+        "twod_sig": twod_sig,
+    }
 
 # ══════════════════════════════════════════════
 #  BROWSER SCAN
@@ -1413,15 +1578,17 @@ def fmt(r):
     rdr = f"{len(r.get('redirects',[]))} hop(s)" if r.get("redirects") else "None"
 
     # Checkout
-    cs    = r.get("checkout",{})
-    mode  = cs.get("mode","Unknown")
-    score = cs.get("score",0)
-    evid  = cs.get("evidence",[])
+    cs      = r.get("checkout",{})
+    mode    = cs.get("mode","Unknown")
+    label   = cs.get("label","Unknown")
+    evid    = cs.get("evidence",[])
+    twod_sig= cs.get("twod_sig","")
     if mode=="3D":
-        cs_str = f"🔒 3D Secure"
+        cs_str = f"🔒 {label}"
         if evid: cs_str += f" [{evid[0]}]"
     elif mode=="2D":
-        cs_str = "⚠️ 2D (no 3DS)"
+        cs_str = f"⚠️ 2D (No 3DS)"
+        if twod_sig: cs_str += f" [{twod_sig}]"
     else:
         cs_str = "❓ Unknown"
 
@@ -1838,10 +2005,11 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     limit = await get_global_daily_limit()
     kb    = InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Stats",       callback_data="adm:stats"),
-         InlineKeyboardButton("📢 Broadcast",   callback_data="adm:broadcast")],
-        [InlineKeyboardButton("🗑 Clear Cache", callback_data="adm:clearcache"),
+         InlineKeyboardButton("👥 Users",        callback_data="adm:users")],
+        [InlineKeyboardButton("📢 Broadcast",   callback_data="adm:broadcast"),
          InlineKeyboardButton("🔔 Monitors",    callback_data="adm:monitors")],
-        [InlineKeyboardButton("⚙️ Help",        callback_data="adm:help")],
+        [InlineKeyboardButton("🗑 Clear Cache", callback_data="adm:clearcache"),
+         InlineKeyboardButton("⚙️ Help",        callback_data="adm:help")],
     ])
     await update.message.reply_text(
         f"🛡 *Admin Panel v10*\n\n"
@@ -1932,6 +2100,51 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: await ack.edit_text(f"📢 Done ✅{sent} ❌{fail}")
     except Exception: pass
 
+async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """List all users with ID, name, scan stats."""
+    if not is_admin(update.effective_user.id): return
+    await _send_user_list(update.message.reply_text, page=0)
+
+async def _send_user_list(reply_fn, page=0):
+    """Format and send paginated user list."""
+    users = await db_all_users()
+    PAGE  = 10
+    total = len(users)
+    start = page * PAGE
+    chunk = users[start:start+PAGE]
+
+    today = date.today().isoformat()
+    lines = [f"👥 *User List* — {total} users (page {page+1}/{(total-1)//PAGE+1})\n"]
+
+    for i, u in enumerate(chunk, start+1):
+        uid   = u["uid"]
+        name  = u.get("first_name") or "?"
+        uname = f"@{u['username']}" if u.get("username") else "—"
+        scans = u.get("scan_count", 0)
+        today_scans = u.get("daily_scans", 0) if u.get("daily_date","") == today else 0
+        limit = "∞" if u.get("is_vip") else str(u.get("daily_limit", DAILY_LIMIT))
+
+        badge = ""
+        if u.get("is_vip"):    badge = " ⭐VIP"
+        if u.get("is_banned"): badge = " 🚫Ban"
+
+        lines.append(
+            f"`{i}.` *{name}*{badge} {uname}\n"
+            f"   ID: `{uid}` | Scans: `{scans}` | Today: `{today_scans}` | Limit: `{limit}/day`"
+        )
+
+    msg = "\n".join(lines)
+
+    # Pagination buttons
+    btns = []
+    if page > 0:
+        btns.append(InlineKeyboardButton("◀️ Prev", callback_data=f"adm:users:{page-1}"))
+    if start + PAGE < total:
+        btns.append(InlineKeyboardButton("Next ▶️", callback_data=f"adm:users:{page+1}"))
+    kb = InlineKeyboardMarkup([btns]) if btns else None
+
+    await reply_fn(msg, parse_mode="Markdown", reply_markup=kb)
+
 async def cmd_clearcache(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     await db_clear_cache(); await update.message.reply_text("🗑 Cache cleared!")
@@ -1943,6 +2156,9 @@ async def on_admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(q.from_user.id): return
     action = q.data.replace("adm:","")
     if action=="stats":      await cmd_stats(update,ctx)
+    elif action.startswith("users"):
+        page = int(action.split(":")[1]) if ":" in action else 0
+        await _send_user_list(q.message.reply_text, page=page)
     elif action=="clearcache": await db_clear_cache(); await q.message.reply_text("🗑 Cleared!")
     elif action=="monitors":
         monitors = await db_get_monitors()
@@ -2039,6 +2255,7 @@ USER_CMDS = [
 ADMIN_CMDS = USER_CMDS + [
     BotCommand("admin",      "🛡 Admin panel"),
     BotCommand("stats",      "📊 Stats"),
+    BotCommand("users",      "👥 User list with IDs"),
     BotCommand("setdaily",   "📅 /setdaily <n> — daily limit all users"),
     BotCommand("ban",        "🚫 /ban <uid>"),
     BotCommand("unban",      "✅ /unban <uid>"),
@@ -2097,7 +2314,7 @@ def main():
         ("fresh",cmd_fresh),("cancel",cmd_cancel),("last",cmd_last),
         ("export",cmd_export),("bulk",cmd_bulk),
         ("monitor",cmd_monitor),("unmonitor",cmd_unmonitor),
-        ("admin",cmd_admin),("stats",cmd_stats),
+        ("admin",cmd_admin),("stats",cmd_stats),("users",cmd_users),
         ("setdaily",cmd_setdaily),
         ("ban",cmd_ban),("unban",cmd_unban),
         ("vip",cmd_vip),("unvip",cmd_unvip),
